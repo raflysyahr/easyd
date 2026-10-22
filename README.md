@@ -1,5 +1,5 @@
-VCT — Video Compression Transfer
-================================
+VCT — Video Compression Transfer v1.1.0
+=======================================
 
 Files
 -----
@@ -39,21 +39,34 @@ If needed, add the following line to ~/.bashrc (or ~/.zshrc):
 
 Dependency handling
 -------------------
-The installer checks for zstd, sha256sum, curl, and yt-dlp. If any are missing,
-it offers to install them using a supported package manager (Termux pkg, apt-get,
-dnf, pacman, or apk). Dependency installation can be skipped; VCT will still be
-installed, and can check/install dependencies again when run.
+VCT checks for zstd, sha256sum, curl, yt-dlp, ffmpeg, and ffprobe. Missing
+packages are offered for installation using a supported package manager
+(Termux pkg, apt-get, dnf, pacman, or apk). ffmpeg/ffprobe are used for direct
+MPEG-DASH/MPD manifest URLs that return XML instead of a video file. Dependency
+installation can be skipped; VCT can check/install dependencies again later.
 
-Optional environment settings:
-  VCT_INSTALL_DIR=/custom/path   Select an install directory.
-  VCT_INSTALL_DEPS=0             Skip dependency installation.
-  VCT_INSTALL_DEPS=1             Attempt dependency installation without asking.
-  VCT_YES=1                      Automatically confirm installer prompts.
+Downloading MPEG-DASH / MPD
+---------------------------
+Choose Download video/file -> option 3 and paste the complete manifest URL,
+even when it does not end with .mpd. VCT probes the available video
+representations, lets you choose a quality, chooses the highest-bitrate audio
+representation detected, then uses FFmpeg stream-copy (no re-encoding) to write
+an MKV file. Signed URLs can expire or depend on server-side access conditions;
+VCT does not bypass DRM or access restrictions.
 
 Important note about compression
 --------------------------------
-Zstandard is lossless, so decompression restores the exact file bytes. Already-
-compressed video files (MP4, MKV, WebM) often shrink only slightly or may grow.
-VCT keeps a .zst output only when it is smaller than the source. Transfer both
-video.zst and video.zst.sha256, then use the VCT restore menu on the receiving
-machine to decompress and verify the SHA-256.
+Zstandard is lossless, so decompression restores the exact bytes of the file
+that VCT compressed. Already-compressed video files (MP4, MKV, WebM) often
+shrink only slightly or may grow. VCT keeps a .zst output only when it is smaller
+than the source. Transfer both video.zst and video.zst.sha256, then use the VCT
+restore menu on the receiving machine to decompress and verify the SHA-256.
+
+MPD note
+--------
+An MPD manifest is not itself a single video file; it describes available
+representations. Downloading an MPD with FFmpeg produces the selected video/audio
+streams in an MKV container. The selected stream contents are copied without
+re-encoding, but the MKV file is a newly assembled output, not byte-identical to
+any original container that might have existed upstream. Subsequent Zstandard
+compression/decompression preserves this generated MKV byte-for-byte.
