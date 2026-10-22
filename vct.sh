@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_NAME="VCT - Video Compression Transfer"
-VERSION="1.0.0"
+VERSION="1.1.0"
 DOWNLOAD_DIR="downloads"
 CURRENT_TMP=""
 
@@ -73,13 +73,14 @@ command_to_package() {
     sha256sum) printf '%s' 'coreutils' ;;
     curl) printf '%s' 'curl' ;;
     yt-dlp) printf '%s' 'yt-dlp' ;;
+    ffmpeg|ffprobe) printf '%s' 'ffmpeg' ;;
     *) return 1 ;;
   esac
 }
 
 list_missing_commands() {
   local cmd
-  for cmd in zstd sha256sum curl yt-dlp; do
+  for cmd in zstd sha256sum curl yt-dlp ffmpeg ffprobe; do
     command -v "$cmd" >/dev/null 2>&1 || printf '%s\n' "$cmd"
   done
 }
@@ -131,7 +132,7 @@ check_dependencies() {
   done < <(list_missing_commands)
 
   if ((${#missing_cmds[@]} == 0)); then
-    ok "Semua dependency tersedia: zstd, sha256sum, curl, yt-dlp."
+    ok "Semua dependency tersedia: zstd, sha256sum, curl, yt-dlp, ffmpeg, ffprobe."
     return 0
   fi
 
@@ -256,16 +257,157 @@ download_with_ytdlp() {
   yt-dlp --no-playlist --newline --paths "$DOWNLOAD_DIR" -o '%(title).180B [%(id)s].%(ext)s' "$url"
 }
 
+download_dash_mpd() {
+  require_command ffmpeg || return 1
+  require_command ffprobe || return 1
+
+  local url output probe_output line item key value idx typ codec width height bitrate
+  local best_video_idx="" best_video_area=-1 best_video_rate=-1
+  local best_audio_idx="" best_audio_rate=-1
+  local selected_video_idx="" choice pos area rate
+  local tmp
+  local -a video_indices=() audio_indices=() parts=() ffargs=()
+  local -A stream_type=() stream_codec=() stream_width=() stream_height=() stream_rate=()
+
+  read -r -p 'URL manifest DASH/MPD (URL boleh tidak berakhiran .mpd): ' url || return 1
+  [[ "$url" =~ ^https?:// ]] || { error "URL harus dimulai dengan http:// atau https://"; return 1; }
+  get_download_dir || return 1
+  read -r -p "Nama/path output [${DOWNLOAD_DIR}/video.mkv]: " output || return 1
+  output="$(expand_path "${output:-$DOWNLOAD_DIR/video.mkv}")"
+  if [[ "$output" != *.mkv ]]; then
+    warn 'Output DASH/MPD akan disimpan dalam kontainer Matroska agar stream video/audio bisa disalin tanpa encoding ulang.'
+    output="${output}.mkv"
+    info "Nama output disesuaikan menjadi: $output"
+  fi
+  safe_prepare_destination "$output" || return 1
+
+  info 'Membaca manifest dan daftar representasi dengan ffprobe...'
+  if ! probe_output="$(ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,bit_rate -of compact=p=0:nk=0 "$url" 2>&1)"; then
+    error 'Tidak bisa membaca manifest MPD. URL mungkin kedaluwarsa, dibatasi server, atau bukan manifest yang didukung FFmpeg.'
+    say 'Pesan ffprobe:'
+    say "$probe_output"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    idx=''; typ=''; codec=''; width='0'; height='0'; bitrate='0'
+    IFS='|' read -r -a parts <<< "$line"
+    for item in "${parts[@]}"; do
+      key="${item%%=*}"
+      value="${item#*=}"
+      case "$key" in
+        index) idx="$value" ;;
+        codec_type) typ="$value" ;;
+        codec_name) codec="$value" ;;
+        width) width="$value" ;;
+        height) height="$value" ;;
+        bit_rate) bitrate="$value" ;;
+      esac
+    done
+    [[ "$idx" =~ ^[0-9]+$ ]] || continue
+    [[ "$width" =~ ^[0-9]+$ ]] || width='0'
+    [[ "$height" =~ ^[0-9]+$ ]] || height='0'
+    [[ "$bitrate" =~ ^[0-9]+$ ]] || bitrate='0'
+    stream_type["$idx"]="$typ"
+    stream_codec["$idx"]="$codec"
+    stream_width["$idx"]="$width"
+    stream_height["$idx"]="$height"
+    stream_rate["$idx"]="$bitrate"
+    case "$typ" in
+      video) video_indices+=("$idx") ;;
+      audio) audio_indices+=("$idx") ;;
+    esac
+  done <<< "$probe_output"
+
+  if ((${#video_indices[@]} == 0)); then
+    error 'Manifest tidak menyediakan stream video yang bisa dibaca FFmpeg.'
+    return 1
+  fi
+
+  for idx in "${video_indices[@]}"; do
+    area=$(( ${stream_width[$idx]} * ${stream_height[$idx]} ))
+    rate="${stream_rate[$idx]}"
+    if (( area > best_video_area || (area == best_video_area && rate > best_video_rate) )); then
+      best_video_idx="$idx"
+      best_video_area="$area"
+      best_video_rate="$rate"
+    fi
+  done
+  for idx in "${audio_indices[@]}"; do
+    rate="${stream_rate[$idx]}"
+    if [[ -z "$best_audio_idx" ]] || (( rate > best_audio_rate )); then
+      best_audio_idx="$idx"
+      best_audio_rate="$rate"
+    fi
+  done
+
+  say ''
+  say 'Representasi video yang tersedia:'
+  for pos in "${!video_indices[@]}"; do
+    idx="${video_indices[$pos]}"
+    local label="${stream_width[$idx]}x${stream_height[$idx]}"
+    [[ "${stream_width[$idx]}" == '0' || "${stream_height[$idx]}" == '0' ]] && label='resolusi tidak diketahui'
+    printf '  %d) %s | %s | %s kbps | stream index %s' \
+      "$((pos + 1))" "$label" "${stream_codec[$idx]:-unknown}" "$(( ${stream_rate[$idx]} / 1000 ))" "$idx"
+    [[ "$idx" == "$best_video_idx" ]] && printf '  [resolusi tertinggi]'
+    printf '\n'
+  done
+  say '  0) Gunakan representasi dengan resolusi tertinggi (default)'
+  read -r -p 'Pilih kualitas video [0]: ' choice || return 1
+  choice="${choice:-0}"
+  if [[ "$choice" == '0' ]]; then
+    selected_video_idx="$best_video_idx"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#video_indices[@]} )); then
+    selected_video_idx="${video_indices[$((choice - 1))]}"
+  else
+    error 'Pilihan kualitas tidak valid.'
+    return 1
+  fi
+
+  info "Video dipilih: stream $selected_video_idx (${stream_width[$selected_video_idx]}x${stream_height[$selected_video_idx]}, ${stream_codec[$selected_video_idx]:-unknown})."
+  if [[ -n "$best_audio_idx" ]]; then
+    info "Audio otomatis dipilih dengan bitrate tertinggi yang terdeteksi: stream $best_audio_idx (${stream_codec[$best_audio_idx]:-unknown}, $(( ${stream_rate[$best_audio_idx]} / 1000 )) kbps)."
+  else
+    warn 'Manifest tidak menyediakan stream audio yang terdeteksi; output akan berisi video saja.'
+  fi
+  warn 'FFmpeg akan menyalin stream tanpa encoding ulang (remux). Ini bukan bypass DRM atau pembatasan akses; URL harus tetap valid dan memang dapat kamu akses.'
+
+  tmp="$(mktemp "${output}.part.XXXXXX")" || { error 'Tidak bisa membuat file sementara.'; return 1; }
+  CURRENT_TMP="$tmp"
+  ffargs=(-hide_banner -nostdin -y -i "$url" -map "0:${selected_video_idx}")
+  if [[ -n "$best_audio_idx" ]]; then
+    ffargs+=(-map "0:${best_audio_idx}")
+  fi
+  ffargs+=(-c copy -f matroska "$tmp")
+
+  info 'Mengunduh representasi dan menggabungkan audio/video...'
+  if ! ffmpeg "${ffargs[@]}"; then
+    error 'FFmpeg gagal mengunduh atau menggabungkan MPD. URL mungkin kedaluwarsa atau aksesnya ditolak.'
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]] || ! ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$tmp" >/dev/null 2>&1; then
+    error 'Output tidak valid atau kosong; file tidak akan disimpan.'
+    return 1
+  fi
+  mv -f -- "$tmp" "$output"
+  CURRENT_TMP=''
+  ok "Download MPD selesai: $output ($(human_size "$(file_size_bytes "$output")"))"
+  info 'Kamu sekarang bisa memilih menu kompresi lossless untuk menguji apakah file MKV dapat diperkecil dengan Zstandard.'
+}
+
 download_menu() {
   local choice
   printf '\n%sDownload%s\n' "$C_BOLD" "$C_RESET"
-  say '1) URL langsung (curl; file URL harus dapat diakses langsung)' 
+  say '1) URL file langsung (curl)' 
   say '2) Situs yang didukung yt-dlp'
+  say '3) Manifest DASH/MPD (FFmpeg; URL bisa tidak berakhiran .mpd)'
   say '0) Kembali'
   read -r -p 'Pilih: ' choice || return 0
   case "$choice" in
     1) download_direct ;;
     2) download_with_ytdlp ;;
+    3) download_dash_mpd ;;
     0) return 0 ;;
     *) warn "Pilihan tidak dikenal." ;;
   esac
@@ -528,7 +670,7 @@ show_menu() {
 main() {
   local choice
   say "${APP_NAME} v${VERSION}"
-  say 'Tools Bash untuk download, kompresi lossless, dan pemulihan file.'
+  say 'Tools Bash untuk download, MPD/DASH, kompresi lossless, dan pemulihan file.'
   say 'Catatan: video yang sudah terkompresi biasanya tidak banyak mengecil dengan Zstd.'
   check_dependencies || true
 
